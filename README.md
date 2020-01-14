@@ -1,2 +1,11 @@
-# ACMH-ACMM
-对论文《Multi-Scale Geometric Consistency Guided Multi-View Stereo》的复现
+# ACMH & ACMM
+对论文《Multi-Scale Geometric Consistency Guided Multi-View Stereo》的复现  
+  
+在CVPR2019上看到了这篇文章，感觉对自己很有启发，因此想要看看源码。但无奈作者并未开源，只能自己动手实现一下。  
+  
+## 几点说明
+1. 这是我仅仅凭借论文复现出来的，和原本的ACMM肯定会有一些差异，效果肯定也会差一些
+2. 项目中的只是我实现的ACMM，在之前还有SFM部分，但由于不是我写的，所以就不方便放上来了
+3. 本人对CUDA不是很熟悉，因此只用了CPU，导致速度非常慢
+
+#### 最最重要的：我只是个刚入坑的菜鸡，要是有大佬有幸看到了这个，一定给我提提建议啊！！！
