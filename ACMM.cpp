@@ -6,6 +6,9 @@
 
 using namespace REC3D;
 
+typedef vector<cv::Mat> WeightMap;
+typedef vector<WeightMap> WeightMapArr;
+
 namespace OPT
 {
 extern float fNCCThreshold;      // NCC阈值
@@ -862,118 +865,136 @@ void ACMH(ImageArr &images, int refID, vector<cv::Mat> weightMapArr, bool geo_co
 }
 
 // 细节恢复器
-void DetailRestore(ImageArr &images, const int refID, vector<cv::Mat> weightMapArr)
+void DetailRestore(ImageArr &images, const int refID, WeightMap weightMap)
 {
+    ASSERT(weightMap[0].size() == (images[0].depthMap.size() / 2));
     Image &refImage = images[refID];
-    InitMatchingCost(images, refID);
+
+    // 这是存储 init Photometric Consistency Cost
+    cv::Mat initCostMap = cv::Mat::zeros(refImage.depthMap.size(), CV_32F);
     if (DEBUG_DERES)
         LOG(INFO) << "Finish init matching cost";
-    for (int i = 0; i < refImage.width; i++)
-        for (int j = 0; j < refImage.height; j++)
+    # pragma omp parallel for schedule(dynamic)
+    for (int i = 0; i < refImage.height; i++)
+        for (int j = 0; j < refImage.width; j++)
         {
-            cv::Point2i pt(i, j);
+            cv::Point2i pt(j, i);
             float depth = refImage.depthMap.at<float>(pt);
             cv::Vec3f normal = refImage.normalMap.at<cv::Vec3f>(pt);
             vector<pair<float, cv::Vec3f>> good_depth_normal;
             good_depth_normal.push_back(make_pair(depth, normal));
             cv::Mat bilateralNCC = ComputeBilateralNCC(images, good_depth_normal, pt, refID);
             ASSERT(bilateralNCC.rows == 1);
-
+            
             float weightSum = 0, a = 0;
             cv::Point2i ptDown(i / 2, j / 2);
             for (cv::MatIterator_<float> it = bilateralNCC.begin<float>(); it != bilateralNCC.end<float>(); it++)
             {
-                float weight = weightMapArr[j].at<float>(pt);
-                a += *(it)*weight;
+                float weight = weightMap[it - bilateralNCC.begin<float>()].at<float>(ptDown);
+                a += *(it) * weight;
                 weightSum += weight;
             }
             // 通过上采样后得到的深度和法向计算的光度一致性代价
             const float initPhotoCost = a / weightSum;
             if (DEBUG_DERES)
                 LOG(INFO) << "Finish computing initial photo consistency cost, which is " << initPhotoCost;
-            /*以下是使用basic MVS计算一次光度一致性代价
-              其实就是ACMH，不过是只迭代一次的ACMH*/
-            // 使用初始的匹配代价从pt周围的点里选出8个比较好的，存储在good里
-            vector<cv::Point2i> good = CheckerboardSampling(refImage, pt, refImage.confMap);
-            ASSERT(good.size() == 8);
-            if (DEBUG_DERES)
-                LOG(INFO) << "Finish checker board sample";
-            good_depth_normal.clear();
-            for (auto point : good)
+            initCostMap.at<float>(pt) = initPhotoCost;
+        }
+
+    /*以下是使用basic MVS计算一次光度一致性代价
+    其实就是ACMH，不过是只迭代一次的ACMH*/
+    // 接下来ACMH要用这两个作为深度图和法向图，不能在原图上操作
+    cv::Mat depthMapTmp = refImage.depthMap.clone();
+    cv::Mat normalMapTmp = refImage.normalMap.clone();
+    cv::Mat confMapTmp = cv::Mat::zeros(refImage.depthMap.size(), CV_32F);
+
+    cv::Mat initCost = InitMatchingCost(images, refID);
+    LOG(INFO) << "Finish init matching cost";
+    // 这样是为了增加并行性，一次性处理一半的点，就像棋盘格
+    for (int a = 0; a < 2; a++)
+    {
+        for (int i = 0; i < refImage.height; i++)
+            #pragma omp parallel for schedule(dynamic)
+            for (int j = (i % 2 + a) % 2; j < refImage.width; j += 2)
             {
-                float d = refImage.depthMap.at<float>(point);
-                cv::Vec3f n = refImage.normalMap.at<cv::Vec3f>(point);
-                pair<float, cv::Vec3f> depth_normal = make_pair(d, n);
-                good_depth_normal.push_back(depth_normal);
+                cv::Point2i pt(j, i);
+                // 使用初始的匹配代价从pt周围的点里选出8个比较好的，存储在good里
+                vector<cv::Point2i> good = CheckerboardSampling(refImage, pt, initCost);
+                ASSERT(good.size() == 8);
+                if (DEBUG_DERES)
+                    LOG(INFO) << "Finish checker board sample";
+                vector<pair<float, cv::Vec3f>> good_depth_normal;
+                for (auto point : good)
+                {
+                    float d = refImage.depthMap.at<float>(point);
+                    cv::Vec3f n = refImage.normalMap.at<cv::Vec3f>(point);
+                    pair<float, cv::Vec3f> depth_normal = make_pair(d, n);
+                    good_depth_normal.push_back(depth_normal);
+                }
+                cv::Mat bilateralCost = ComputeBilateralNCC(images, good_depth_normal, pt, refID);
+                if (DEBUG_DERES)
+                    LOG(INFO) << "Finish computing cost matrix with NCC for the 1st time";
+                Eigen::ArrayXf viewWeight;
+                pair<int, float> idx_cost;
+                int tmp = INT_MAX;
+                viewWeight = ComputeViewWeight(bilateralCost, 0, refID, tmp);
+                idx_cost = SelectHypotheses(bilateralCost, viewWeight);
+                if (DEBUG_DERES)
+                    LOG(INFO) << "Find the smallset photo consistency cost";
+
+                depthMapTmp.at<float>(pt) = good_depth_normal[idx_cost.first].first;
+                normalMapTmp.at<cv::Vec3f>(pt) = good_depth_normal[idx_cost.first].second;
+                confMapTmp.at<float>(pt) = idx_cost.second;
             }
-            cv::Mat bilateralCost = ComputeBilateralNCC(images, good_depth_normal, pt, refID);
-            if (DEBUG_DERES)
-                LOG(INFO) << "Finish computing cost matrix with NCC for the 1st time";
-            Eigen::ArrayXf viewWeight;
-            int tmp = INT_MAX;
-            viewWeight = ComputeViewWeight(bilateralCost, 0, refID, tmp);
-            if (DEBUG_DERES)
-                LOG(INFO) << "Finish computing view weight";
-            Eigen::Array<float, Eigen::Dynamic, 1> viewCost;
-            viewCost.resize(bilateralCost.cols);
-            vector<float> photometric;
-            for (int i = 0; i < bilateralCost.rows; i++)
-            {
-                for (int j = 0; j < bilateralCost.cols; j++)
-                    viewCost(i) = bilateralCost.at<float>(i, j);
-                photometric.push_back((viewCost * viewWeight).sum() / viewWeight.sum());
-            }
-            std::vector<float>::iterator smallest = std::min_element(std::begin(photometric), std::end(photometric));
-            int idx = std::distance(std::begin(photometric), smallest);
-            depth = good_depth_normal[idx].first;
-            normal = good_depth_normal[idx].second;
-            if (DEBUG_DERES)
-                LOG(INFO) << "Find the smallset photo consistency cost";
+    }
+    // refine
+    # pragma omp parallel for schedule(dynamic)
+    for(int i = 0; i < refImage.height; i++)
+        for(int j = 0; j < refImage.width; j++)
+        {
+            cv::Point2i pt(j,i);
+            float depth = refImage.depthMap.at<float>(pt);
+            cv::Vec3f normal = refImage.normalMap.at<cv::Vec3f>(pt);
             // 通过最好的猜测再生成9个猜测,然后从这9个里选一个最好的
             vector<pair<float, cv::Vec3f>> refine_depth_normal = GenerateDepthNormal(depth, normal, 0, refImage, pt);
             cv::Mat refine_bilateralCost = ComputeBilateralNCC(images, refine_depth_normal, pt, refID);
             if (DEBUG_DERES)
                 LOG(INFO) << "Finish generating 9 hypotheses with best depth and normal";
+            cv::Mat bilateralCost = ComputeBilateralNCC(images, refine_depth_normal, pt, refID);
+            int tmp = INT_MAX;
+            Eigen::ArrayXf viewWeight;
+            pair<int, float> idx_cost;
             viewWeight = ComputeViewWeight(bilateralCost, 0, refID, tmp);
-            photometric.clear();
-            for (int i = 0; i < bilateralCost.rows; i++)
-            {
-                for (int j = 0; j < bilateralCost.cols; j++)
-                    viewCost(i) = bilateralCost.at<float>(i, j);
-                photometric.push_back((viewCost * viewWeight).sum() / viewWeight.sum());
-            }
-            smallest = std::min_element(std::begin(photometric), std::end(photometric));
-            idx = std::distance(std::begin(photometric), smallest);
+            idx_cost = SelectHypotheses(bilateralCost, viewWeight);
             if (DEBUG_DERES)
                 LOG(INFO) << "Find the smallest photo consistency cost";
 
-            const float mvsPhotoCost = photometric[idx]; // 使用basic MVS算的光度一致性代价
-            if (DEBUG_DERES)
-                LOG(INFO) << "Finish computing cost with basic MVS";
-
-            // 如果两个代价相差大于0.1则选择相信mvs算出来的
-            if (initPhotoCost - mvsPhotoCost > 0.1)
+            if(idx_cost.second < confMapTmp.at<float>(pt))
             {
-                depth = good_depth_normal[idx].first;
-                normal = good_depth_normal[idx].second;
-                refImage.depthMap.at<float>(pt) = depth;
-                refImage.normalMap.at<cv::Vec3f>(pt) = normal;
+                depthMapTmp.at<float>(pt) = refine_depth_normal[idx_cost.first].first;
+                normalMapTmp.at<cv::Vec3f>(pt) = refine_depth_normal[idx_cost.first].second;
+                confMapTmp.at<float>(pt) = idx_cost.second;
             }
-            if (DEBUG_DERES)
-                LOG(INFO) << "Finish detail restore for current point";
         }
+
+    # pragma omp parallel for schedule(dynamic)
+    for(int i = 0; i < refImage.height; i++)
+        for(int j = 0; j < refImage.width; j++)   
+        {
+            cv::Point2i pt(j,i);
+            // 如果两个代价相差大于0.1则选择相信mvs算出来的
+            if ( initCostMap.at<float>(pt) - confMapTmp.at<float>(pt) > 0.1)
+            {
+                refImage.depthMap.at<float>(pt) = depthMapTmp.at<float>(pt);
+                refImage.normalMap.at<cv::Vec3f>(pt) = normalMapTmp.at<cv::Vec3f>(pt);
+            }
+        }            
 }
 
 int EstimateDepthMap2(ImageArr &images)
 {
     int imageNum = images.size();
-    vector<pair<int,int>> ID2index;
-    for(int i=0; i<imageNum; i++)
-    {
-        int realID = images[i].ID;
-        ID2index.push_back(make_pair(realID, i));
-        images[i].ID = i;
-    }
+
     ImageArr downSample1 = DownSampleImageArr(images); //经过一次降采样后的ImageArr 原图的0.5大小
     LOG(INFO) << "finish downsample 1st time";
     ImageArr downSample2 = DownSampleImageArr(downSample1); // 经过两次降采样后的ImageArr  原图的0.25大小
@@ -985,7 +1006,7 @@ int EstimateDepthMap2(ImageArr &images)
     {
         // weightMap是一系列的权重，vector里面的每一项对应了一个视图，矩阵每个点代表了
         // 这个视图对这个点的权重
-        vector<cv::Mat> weightMapArr(imageNum);
+        WeightMapArr weightMapArr(imageNum);
         for (int i = 0; i < imageNum; i++)
             weightMapArr[i] = cv::Mat::zeros(downSample2[0].height, downSample2[0].width, CV_32F);
         // 对经过两次下采样的图像序列进行ACMH
@@ -995,7 +1016,11 @@ int EstimateDepthMap2(ImageArr &images)
             string fileName = "depth_ACMH_0.25_";
             SaveDepthMap(downSample2[i].depthMap, OPT::sDataPath + "/depthmap/init_" + downSample2[i].name);
 
-            ACMH(downSample2, i, weightMapArr);
+            WeightMap weightMap(imageNum);
+            for(int j = 0; j < weightMap.size(); j++)
+                weightMap[j] = cv::Mat::zeros(refImage.height, refImage.width, CV_32F);
+
+            ACMH(downSample2, i, weightMap);
 
             SaveDepthMap(downSample2[i].depthMap, OPT::sDataPath + "/depthmap/" + fileName + downSample2[i].name);
             cv::imwrite(OPT::sDataPath + "/depthmap/normal_" + downSample2[i].name, (downSample2[0].normalMap + 1) / 2 * 255);
@@ -1006,7 +1031,13 @@ int EstimateDepthMap2(ImageArr &images)
         // 根据论文，需要再进行一次 ACMH+geometry constancy
         for (int i = 0; i < imageNum; i++)
         {
-            ACMH(downSample2, i, weightMapArr, true);
+            WeightMap weightMap(imageNum);
+            for(int j = 0; j < weightMap.size(); j++)
+                weightMap[j] = cv::Mat::zeros(downSample2[0].height, downSample2[0].width, CV_32F);
+
+            ACMH(downSample2, i, weightMap, true);
+            weightMapArr[i] = weightMap;
+
             string fileName = "depth_ACMH+geo_0.25_";
             SaveDepthMap(downSample2[i].depthMap, OPT::sDataPath + "/depthmap/" + fileName + downSample2[i].name);
         }
@@ -1025,18 +1056,25 @@ int EstimateDepthMap2(ImageArr &images)
         LOG(INFO) << "finish up sample at coarsest scale";
         // exit(0);
         for (int i = 0; i < imageNum; i++)
-            DetailRestore(images, i, weightMapArr);
+        {
+            DetailRestore(images, i, weightMapArr[i]);
+        }
+            
         LOG(INFO) << "finish detail restoring at coarsest scale";
     }
 
     // 中间尺度的深度计算
     {
-        vector<cv::Mat> weightMapArr(imageNum);
-        for (int i = 0; i < imageNum; i++)
-            weightMapArr[i] = cv::Mat::zeros(downSample1[0].height, downSample1[0].width, CV_32F);
+        WeightMapArr weightMapArr(imageNum);
         for (int i = 0; i < imageNum; i++)
         {
-            ACMH(downSample1, i, weightMapArr, true);
+            WeightMap weightMap(imageNum);
+            for(int j = 0; j < weightMap.size(); j++)
+                weightMap[j] = cv::Mat::zeros(downSample1[0].height, downSample1[0].width, CV_32F);
+
+            ACMH(downSample1, i, weightMap, true);
+            weightMapArr[i] = weightMap;
+
             string fileName = "depth_ACMH_0.5_";
             SaveDepthMap(downSample1[i].depthMap, OPT::sDataPath + "/depthmap/" + fileName + downSample1[i].name);
         }
@@ -1054,18 +1092,23 @@ int EstimateDepthMap2(ImageArr &images)
         }
         LOG(INFO) << "finish up sample at middle scale";
         for (int i = 0; i < imageNum; i++)
-            DetailRestore(images, i, weightMapArr);
+            DetailRestore(images, i, weightMapArr[i]);
         LOG(INFO) << "finish detail restoring at middle scale";
     }
 
     // 原始分辨率的深度计算
     {
-        vector<cv::Mat> weightMapArr(imageNum);
-        for (int i = 0; i < imageNum; i++)
-            weightMapArr[i] = cv::Mat::zeros(images[0].height, images[0].width, CV_32F);
+        WeightMapArr weightMapArr(imageNum);
+        
         for (int i = 0; i < imageNum; i++)
         {
-            ACMH(images, i, weightMapArr, true);
+            WeightMap weightMap(imageNum);
+            for(int j = 0; j < weightMap.size(); j++)
+                weightMap[j] = cv::Mat::zeros(images[0].height, images[0].width, CV_32F);
+
+            ACMH(images, i, weightMap, true);
+            weightMapArr[i] = weightMap;
+
             string fileName = "depth_ACMH_1.0_";
             SaveDepthMap(images[i].depthMap, OPT::sDataPath + "/depthmap/" + fileName + images[i].name);
         }
