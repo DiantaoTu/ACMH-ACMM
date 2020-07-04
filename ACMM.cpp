@@ -583,7 +583,7 @@ cv::Mat InitMatchingCost(ImageArr &images, const int refID)
                 cost += costs[minIndex - costs.begin()];
                 costs.erase(minIndex);
             }
-            initCost.at<float>(pt) = cost;
+            initCost.at<float>(pt) = cost / K;
         }
     return initCost;
 }
@@ -628,12 +628,12 @@ vector<std::pair<float, cv::Vec3f>> GenerateDepthNormal(float depth, cv::Vec3f n
     float rand_depth = rng.uniform(refImage.dMin, refImage.dMax);
     cv::Vec3f rand_normal = GenerateRandomNormal(pt, refImage);
     // 产生随机扰动是借鉴了colmap
-    float perturbation = 1.0f / std::pow(2.0f, iteration);
+    float perturbation = 1.0f / std::pow(2.0f, iteration)  * PI;
     float max_depth = (1 + perturbation) * depth;
     float min_depth = (1 - perturbation) * depth;
     float prt_depth = rng.uniform(0.f, 1.f) * (max_depth - min_depth) + min_depth;
 
-    cv::Vec3f prt_normal = PerturbNormal(normal, perturbation * PI);
+    cv::Vec3f prt_normal = PerturbNormal(normal, perturbation);
     cv::Vec3f view_ray((pt.x - refImage.K(0, 2)) / refImage.K(0, 0), // (col-cx)/fx
                        (pt.y - refImage.K(1, 2)) / refImage.K(1, 1), // (row-cy)/fy
                        1.f);
@@ -646,7 +646,7 @@ vector<std::pair<float, cv::Vec3f>> GenerateDepthNormal(float depth, cv::Vec3f n
             prt_normal = normal;
             break;
         }
-        prt_normal = PerturbNormal(normal, 0.5 * perturbation * PI);
+        prt_normal = PerturbNormal(normal, 0.5 * perturbation);
         perturbation *= 0.5;
         m++;
     }
